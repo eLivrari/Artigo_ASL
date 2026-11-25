@@ -2,7 +2,7 @@
 Estimativa de frequencia cardiaca (BPM) a partir de video facial - rPPG
 (fotopletismografia remota).
 
-Pipeline:
+Pipeline completo (FFT, STFT e CWT):
   1. Deteccao do rosto (Haar cascade do OpenCV) e definicao de ROIs de pele:
      testa e bochechas (evita olhos, boca e barba).
   2. Media RGB das ROIs em cada quadro -> sinal bruto RGB(t).
@@ -10,20 +10,21 @@ Pipeline:
        - GREEN  (Verkruysse et al., 2008)
        - CHROM  (de Haan & Jeanne, 2013)
        - POS    (Wang et al., 2017)  <- metodo principal
-  4. Filtro passa-banda Butterworth 0,7-3,5 Hz (42-210 BPM).
-  5. BPM = pico do espectro (Welch) - no video inteiro e em janelas
-     deslizantes (10 s, passo 1 s) para ver a variacao ao longo do tempo.
-
-Uso:
-  python3 rppg_batimentos.py                      # processa os dois videos
-  python3 rppg_batimentos.py video1.mp4 video2.mp4
-  Referencia opcional (oximetro/relogio):  --ref SemMovimento.mp4=65-75
+  4. Filtro passa-banda Butterworth 0,7-3,5 Hz (42-210 BPM) em fase zero.
+  5. Caracterizacao de nao estacionariedade (media e variancia deslizantes).
+  6. Estimacao comparativa de BPM via:
+       - FFT global (espectro completo / Welch)
+       - STFT (espectrograma, janela Hann 10 s, passo 1 s)
+       - CWT (escalograma, wavelet de Morlet complexa cmor2.0-0.955, 128 escalas)
 
 Saidas (pasta resultados/):
-  <video>_sinal.png     sinal rPPG filtrado + espectro
-  <video>_bpm_tempo.png BPM ao longo do tempo
-  <video>_bpm.csv       BPM por janela
-  resumo.csv            tabela final para o artigo
+  <video>_roi.jpg               frame de exemplo com deteccao facial e ROIs
+  <video>_bruto_vs_filtrado.png sinal bruto vs. filtrado + media/variancia deslizantes
+  <video>_sinal.png             sinal rPPG filtrado (POS) + espectro global
+  <video>_tempo_frequencia.png  espectrograma (STFT) e escalograma (CWT)
+  <video>_bpm_tempo.png         comparacao temporal STFT vs. CWT e entre metodos
+  <video>_bpm.csv               series temporais de BPM (STFT e CWT)
+  resumo.csv                    tabela consolidada (FFT, STFT e CWT) para o artigo
 """
 import argparse
 import csv
@@ -35,13 +36,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pywt
 from scipy import signal
 
 F_MIN, F_MAX = 0.7, 3.5          # Hz  (42 - 210 BPM)
-JANELA_S, PASSO_S = 10.0, 1.0    # janela deslizante
+JANELA_S, PASSO_S = 10.0, 1.0    # janela deslizante STFT
 DESCARTE_INICIO_S = 1.0          # ignora o 1o segundo (ajuste de camera)
+DESCARTE_BORDA_S = 5.0           # descarta 5 s nas extremidades para series temporais
 
-# Referencias medidas por sensor de contato (ajuste com o seu oximetro/relogio)
 REFERENCIAS_PADRAO = {
     "SemMovimento": (65, 75),
     "ComMovimento": (90, 100),
@@ -72,7 +74,8 @@ def extrair_rgb(caminho, salvar_preview=None):
         raise RuntimeError(f"Nao foi possivel abrir {caminho}")
     fps = cap.get(cv2.CAP_PROP_FPS)
     detector = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
 
     rgb, caixa_suave, n = [], None, 0
     while True:
@@ -81,13 +84,12 @@ def extrair_rgb(caminho, salvar_preview=None):
             break
         n += 1
         cinza = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # detecta em resolucao reduzida (mais rapido)
         esc = 0.5
         faces = detector.detectMultiScale(
-            cv2.resize(cinza, None, fx=esc, fy=esc), 1.1, 5, minSize=(60, 60))
+            cv2.resize(cinza, None, fx=esc, fy=esc), 1.1, 5, minSize=(60, 60)
+        )
         if len(faces):
             f = max(faces, key=lambda r: r[2] * r[3]) / esc
-            # suavizacao exponencial da caixa (reduz tremor da ROI)
             caixa_suave = f if caixa_suave is None else 0.85 * caixa_suave + 0.15 * f
         if caixa_suave is None:
             rgb.append([np.nan] * 3)
@@ -114,7 +116,6 @@ def extrair_rgb(caminho, salvar_preview=None):
     cap.release()
 
     rgb = np.array(rgb)
-    # preenche quadros sem deteccao por interpolacao
     for c in range(3):
         col = rgb[:, c]
         nan = np.isnan(col)
@@ -141,8 +142,8 @@ def metodo_chrom(rgb, fps):
         Cn = C / C.mean(axis=0)
         X = 3 * Cn[:, 0] - 2 * Cn[:, 1]
         Y = 1.5 * Cn[:, 0] + Cn[:, 1] - 1.5 * Cn[:, 2]
-        Xf, Yf = signal.filtfilt(b_, a_, X, padlen=min(len(X) - 1, 9)), \
-                 signal.filtfilt(b_, a_, Y, padlen=min(len(Y) - 1, 9))
+        Xf = signal.filtfilt(b_, a_, X, padlen=min(len(X) - 1, 9))
+        Yf = signal.filtfilt(b_, a_, Y, padlen=min(len(Y) - 1, 9))
         alpha = Xf.std() / (Yf.std() + 1e-9)
         S = (Xf - alpha * Yf) * signal.windows.hann(win)
         h[s:s + win] += S
@@ -156,7 +157,7 @@ def metodo_pos(rgb, fps):
     P = np.array([[0, 1, -1], [-2, 1, 1]])
     for m in range(win, N + 1):
         s = m - win
-        C = rgb[s:m].T                       # 3 x win
+        C = rgb[s:m].T
         Cn = C / C.mean(axis=1, keepdims=True)
         S = P @ Cn
         alpha = S[0].std() / (S[1].std() + 1e-9)
@@ -169,7 +170,7 @@ METODOS = {"POS": metodo_pos, "CHROM": metodo_chrom, "GREEN": metodo_green}
 
 
 # ----------------------------------------------------------------------------
-# 4-5. Filtragem e estimativa de BPM
+# 4-6. Filtragem, Nao Estacionariedade e Estimadores (FFT, STFT, CWT)
 # ----------------------------------------------------------------------------
 def filtrar(x, fps):
     b, a = signal.butter(3, [F_MIN, F_MAX], btype="band", fs=fps)
@@ -177,24 +178,68 @@ def filtrar(x, fps):
     return signal.filtfilt(b, a, x)
 
 
-def bpm_espectro(x, fps):
+def estatisticas_deslizantes(x, fps, win_s=3.0, passo_s=0.5):
+    """Media e variancia locais em janelas deslizantes (Eqs. 9 e 10)."""
+    L = int(win_s * fps)
+    D = max(1, int(passo_s * fps))
+    t_w, mu_w, var_w = [], [], []
+    for s in range(0, len(x) - L + 1, D):
+        seg = x[s:s + L]
+        t_w.append((s + L / 2) / fps)
+        mu_w.append(np.mean(seg))
+        var_w.append(np.var(seg, ddof=1))
+    return np.array(t_w), np.array(mu_w), np.array(var_w)
+
+
+def bpm_fft_global(x, fps):
+    """Estimativa global via FFT com zero-padding (Eqs. 5-8)."""
     nfft = max(4096, int(2 ** np.ceil(np.log2(len(x)))) * 4)
-    f, p = signal.welch(x, fs=fps, nperseg=min(len(x), int(8 * fps)),
-                        noverlap=None, nfft=nfft)
+    X = np.abs(np.fft.rfft(x, n=nfft)) ** 2
+    f = np.fft.rfftfreq(nfft, d=1.0 / fps)
     banda = (f >= F_MIN) & (f <= F_MAX)
-    f, p = f[banda], p[banda]
-    return 60.0 * f[np.argmax(p)], f * 60, p
+    f_b, p_b = f[banda], X[banda]
+    return 60.0 * f_b[np.argmax(p_b)], f_b * 60.0, p_b
 
 
-def bpm_janelas(x, fps):
-    jan, passo = int(JANELA_S * fps), int(PASSO_S * fps)
-    tempos, bpms = [], []
-    for s in range(0, len(x) - jan + 1, passo):
-        seg = x[s:s + jan]
-        bpm, _, _ = bpm_espectro(seg, fps)
-        tempos.append((s + jan / 2) / fps)
-        bpms.append(bpm)
-    return np.array(tempos), np.array(bpms)
+def bpm_stft(x, fps):
+    """Estimativa tempo-frequencia via STFT (Eqs. 11-12)."""
+    nw = int(JANELA_S * fps)
+    r = int(PASSO_S * fps)
+    f, t, Sxx = signal.spectrogram(
+        x, fs=fps, window="hann", nperseg=nw, noverlap=nw - r, nfft=4096, mode="psd"
+    )
+    banda = (f >= F_MIN) & (f <= F_MAX)
+    f_b, S_b = f[banda], Sxx[banda, :]
+    idx_max = np.argmax(S_b, axis=0)
+    bpm_t = 60.0 * f_b[idx_max]
+    return t, f_b * 60.0, S_b, bpm_t
+
+
+def bpm_cwt(x, fps, n_escalas=128):
+    """Estimativa multiescala via CWT de Morlet complexa (Eqs. 13-16)."""
+    wavelet = "cmor2.0-0.955"  # omega_0 = 6 -> fc = 6 / (2*pi) ~= 0.955
+    fc = pywt.central_frequency(wavelet)
+    freqs = np.geomspace(F_MIN, F_MAX, n_escalas)
+    escalas = (fc * fps) / freqs
+    coef, _ = pywt.cwt(x, escalas, wavelet, sampling_period=1.0 / fps)
+    escalograma = np.abs(coef) ** 2
+
+    # Subamostra a cada 1 segundo (mesma grade temporal de 1 Hz para comparacao)
+    passo = int(PASSO_S * fps)
+    indices = np.arange(0, len(x), passo)
+    t = indices / fps
+    esc_sub = escalograma[:, indices]
+    idx_max = np.argmax(esc_sub, axis=0)
+    bpm_t = 60.0 * freqs[idx_max]
+    return t, freqs * 60.0, escalograma, bpm_t
+
+
+def aparar_bordas(t, bpm_t, duracao_s, borda_s=DESCARTE_BORDA_S):
+    """Descarta bordas para evitar efeitos de extremidade (Secao III-E)."""
+    mask = (t >= borda_s) & (t <= (duracao_s - borda_s))
+    if mask.sum() == 0:
+        return t, bpm_t
+    return t[mask], bpm_t[mask]
 
 
 # ----------------------------------------------------------------------------
@@ -203,27 +248,77 @@ def processar(caminho, pasta, referencia=None):
     print(f"\n=== {nome} ===")
     rgb, fps = extrair_rgb(caminho, os.path.join(pasta, f"{nome}_roi.jpg"))
     rgb = rgb[int(DESCARTE_INICIO_S * fps):]
-    print(f"  FPS: {fps:.2f} | quadros: {len(rgb)} | duracao: {len(rgb)/fps:.1f} s")
+    duracao_s = len(rgb) / fps
+    print(f"  FPS: {fps:.2f} | quadros: {len(rgb)} | duracao: {duracao_s:.1f} s")
 
+    tt = np.arange(len(rgb)) / fps + DESCARTE_INICIO_S
+
+    # 1. Grafico: Dado Bruto vs. Filtrado + Nao Estacionariedade (Eqs. 9 e 10)
+    sinal_pos_bruto = metodo_pos(rgb, fps)
+    sinal_pos_filt = filtrar(sinal_pos_bruto, fps)
+    t_w, mu_w, var_w = estatisticas_deslizantes(rgb[:, 1], fps, win_s=3.0, passo_s=0.5)
+
+    fig, ax = plt.subplots(3, 1, figsize=(10, 7.5), sharex=False)
+    ax[0].plot(tt, rgb[:, 1], color="tab:green", lw=1)
+    ax[0].set(title=f"{nome} - Canal Verde Bruto (com nivel DC e deriva de iluminacao)",
+              ylabel="Intensidade (0-255)")
+    ax[0].grid(alpha=0.3)
+
+    ax[1].plot(tt, sinal_pos_filt, color="tab:blue", lw=1)
+    ax[1].set(title=f"{nome} - Sinal POS apos Detrend e Filtro Butterworth (0,7-3,5 Hz)",
+              ylabel="Amplitude norm.")
+    ax[1].grid(alpha=0.3)
+
+    ax2_twin = ax[2].twinx()
+    l1 = ax[2].plot(t_w + DESCARTE_INICIO_S, mu_w, color="tab:orange", lw=1.5, label="Media local $\\mu_w[m]$")
+    l2 = ax2_twin.plot(t_w + DESCARTE_INICIO_S, var_w, color="tab:purple", ls="--", lw=1.5, label="Variancia local $\\sigma_w^2[m]$")
+    ax[2].set(title=f"{nome} - Caracterizacao de Nao Estacionariedade (janela 3 s)",
+              xlabel="Tempo (s)", ylabel="Media local (intensidade)")
+    ax2_twin.set_ylabel("Variancia local")
+    linhas_leg = l1 + l2
+    ax[2].legend(linhas_leg, [l.get_label() for l in linhas_leg], loc="upper right")
+    ax[2].grid(alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(pasta, f"{nome}_bruto_vs_filtrado.png"), dpi=150)
+    plt.close(fig)
+
+    # 2. Executa os 3 metodos (POS, CHROM, GREEN) x 3 transformadas (FFT, STFT, CWT)
     resultados = {}
     for nm, fn in METODOS.items():
         sinal = filtrar(fn(rgb, fps), fps)
-        bpm_global, fb, pb = bpm_espectro(sinal, fps)
-        t, bpm_t = bpm_janelas(sinal, fps)
-        resultados[nm] = dict(sinal=sinal, bpm=bpm_global, fb=fb, pb=pb, t=t, bpm_t=bpm_t)
-        print(f"  {nm:6s}: BPM global = {bpm_global:6.1f} | janelas: "
-              f"media {bpm_t.mean():.1f}  mediana {np.median(bpm_t):.1f}  "
-              f"min {bpm_t.min():.1f}  max {bpm_t.max():.1f}")
 
-    # ---- figuras (metodo principal: POS)
+        # FFT global
+        bpm_fft, fb_fft, pb_fft = bpm_fft_global(sinal, fps)
+
+        # STFT
+        t_stft, fb_stft, S_stft, bpm_stft_raw = bpm_stft(sinal, fps)
+        t_stft_ap, bpm_stft_ap = aparar_bordas(t_stft, bpm_stft_raw, duracao_s)
+
+        # CWT
+        t_cwt, fb_cwt, E_cwt, bpm_cwt_raw = bpm_cwt(sinal, fps)
+        t_cwt_ap, bpm_cwt_ap = aparar_bordas(t_cwt, bpm_cwt_raw, duracao_s)
+
+        resultados[nm] = dict(
+            sinal=sinal,
+            bpm_fft=bpm_fft, fb_fft=fb_fft, pb_fft=pb_fft,
+            t_stft=t_stft, fb_stft=fb_stft, S_stft=S_stft,
+            t_stft_ap=t_stft_ap, bpm_stft=bpm_stft_ap,
+            t_cwt=t_cwt, fb_cwt=fb_cwt, E_cwt=E_cwt,
+            t_cwt_ap=t_cwt_ap, bpm_cwt=bpm_cwt_ap,
+        )
+        print(f"  {nm:6s} | FFT: {bpm_fft:5.1f} BPM | "
+              f"STFT media: {bpm_stft_ap.mean():5.1f} (dp {bpm_stft_ap.std():4.1f}) | "
+              f"CWT media: {bpm_cwt_ap.mean():5.1f} (dp {bpm_cwt_ap.std():4.1f})")
+
+    # 3. Grafico: Sinal filtrado + Espectro FFT (POS)
     r = resultados["POS"]
-    tt = np.arange(len(r["sinal"])) / fps + DESCARTE_INICIO_S
     fig, ax = plt.subplots(2, 1, figsize=(10, 6))
     ax[0].plot(tt, r["sinal"], lw=1)
     ax[0].set(title=f"{nome} - sinal rPPG (POS, filtrado 0,7-3,5 Hz)",
               xlabel="Tempo (s)", ylabel="Amplitude")
-    ax[1].plot(r["fb"], r["pb"] / r["pb"].max(), lw=1.5)
-    ax[1].axvline(r["bpm"], color="r", ls="--", label=f"pico = {r['bpm']:.1f} BPM")
+    ax[1].plot(r["fb_fft"], r["pb_fft"] / r["pb_fft"].max(), lw=1.5)
+    ax[1].axvline(r["bpm_fft"], color="r", ls="--", label=f"pico FFT = {r['bpm_fft']:.1f} BPM")
     if referencia:
         ax[1].axvspan(*referencia, color="g", alpha=0.15,
                       label=f"referencia {referencia[0]}-{referencia[1]} BPM")
@@ -233,25 +328,71 @@ def processar(caminho, pasta, referencia=None):
     fig.savefig(os.path.join(pasta, f"{nome}_sinal.png"), dpi=150)
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    for nm, rr in resultados.items():
-        ax.plot(rr["t"] + DESCARTE_INICIO_S, rr["bpm_t"], marker="o", ms=3, label=nm)
+    # 4. Grafico 2D: Espectrograma (STFT) vs. Escalograma (CWT Morlet) para POS
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
+    im0 = ax[0].pcolormesh(
+        r["t_stft"] + DESCARTE_INICIO_S, r["fb_stft"],
+        r["S_stft"] / (r["S_stft"].max() + 1e-12),
+        shading="gouraud", cmap="viridis"
+    )
+    ax[0].plot(r["t_stft_ap"] + DESCARTE_INICIO_S, r["bpm_stft"], "w--", lw=1.5, label="Crista STFT")
     if referencia:
-        ax.axhspan(*referencia, color="g", alpha=0.15, label="referencia (sensor)")
-    ax.set(title=f"{nome} - BPM ao longo do tempo (janela {JANELA_S:.0f} s)",
-           xlabel="Tempo (s)", ylabel="BPM", ylim=(40, 160))
-    ax.legend()
-    ax.grid(alpha=0.3)
+        ax[0].axhline(referencia[0], color="lime", ls=":", lw=1)
+        ax[0].axhline(referencia[1], color="lime", ls=":", lw=1, label="Faixa ref.")
+    ax[0].set(title=f"{nome} - Espectrograma STFT (POS)", xlabel="Tempo (s)", ylabel="Frequencia (BPM)", ylim=(42, 180))
+    ax[0].legend(loc="upper right")
+    fig.colorbar(im0, ax=ax[0], label="Potencia norm.")
+
+    im1 = ax[1].pcolormesh(
+        tt, r["fb_cwt"],
+        r["E_cwt"] / (r["E_cwt"].max() + 1e-12),
+        shading="gouraud", cmap="viridis"
+    )
+    ax[1].plot(r["t_cwt_ap"] + DESCARTE_INICIO_S, r["bpm_cwt"], "w--", lw=1.5, label="Crista CWT")
+    if referencia:
+        ax[1].axhline(referencia[0], color="lime", ls=":", lw=1)
+        ax[1].axhline(referencia[1], color="lime", ls=":", lw=1, label="Faixa ref.")
+    ax[1].set(title=f"{nome} - Escalograma CWT Morlet (POS)", xlabel="Tempo (s)", ylim=(42, 180))
+    ax[1].legend(loc="upper right")
+    fig.colorbar(im1, ax=ax[1], label="Energia norm.")
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(pasta, f"{nome}_tempo_frequencia.png"), dpi=150)
+    plt.close(fig)
+
+    # 5. Grafico Temporal: Comparacao STFT vs. CWT e entre Metodos (POS, CHROM, GREEN)
+    fig, ax = plt.subplots(2, 1, figsize=(10, 6.5), sharex=True)
+    for nm, rr in resultados.items():
+        ax[0].plot(rr["t_stft_ap"] + DESCARTE_INICIO_S, rr["bpm_stft"], marker="o", ms=3, label=f"{nm} (STFT)")
+        ax[1].plot(rr["t_cwt_ap"] + DESCARTE_INICIO_S, rr["bpm_cwt"], marker="s", ms=3, label=f"{nm} (CWT)")
+
+    for a_i, titulo in zip(ax, ["STFT (janela 10 s)", "CWT (Wavelet de Morlet)"]):
+        if referencia:
+            a_i.axhspan(*referencia, color="g", alpha=0.15, label="referencia (sensor)")
+        a_i.set(title=f"{nome} - BPM ao longo do tempo via {titulo}", ylabel="BPM", ylim=(40, 160))
+        a_i.legend(loc="upper right", ncol=2)
+        a_i.grid(alpha=0.3)
+    ax[1].set_xlabel("Tempo (s)")
+
     fig.tight_layout()
     fig.savefig(os.path.join(pasta, f"{nome}_bpm_tempo.png"), dpi=150)
     plt.close(fig)
 
+    # 6. CSV das series temporais (STFT e CWT)
     with open(os.path.join(pasta, f"{nome}_bpm.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["tempo_s"] + [f"bpm_{m}" for m in resultados])
-        for i, t in enumerate(r["t"]):
-            w.writerow([f"{t + DESCARTE_INICIO_S:.1f}"] +
-                       [f"{resultados[m]['bpm_t'][i]:.1f}" for m in resultados])
+        w.writerow(
+            ["tempo_s"]
+            + [f"stft_{m}" for m in resultados]
+            + [f"cwt_{m}" for m in resultados]
+        )
+        n_lin = min(len(r["t_stft_ap"]), len(r["t_cwt_ap"]))
+        for i in range(n_lin):
+            w.writerow(
+                [f"{r['t_stft_ap'][i] + DESCARTE_INICIO_S:.1f}"]
+                + [f"{resultados[m]['bpm_stft'][i]:.1f}" for m in resultados]
+                + [f"{resultados[m]['bpm_cwt'][i]:.1f}" for m in resultados]
+            )
     return nome, resultados
 
 
@@ -279,19 +420,36 @@ def main():
         ref = refs.get(nome)
         nome, res = processar(v, a.saida, ref)
         for m, r in res.items():
-            linha = dict(video=nome, metodo=m, bpm_global=round(r["bpm"], 1),
-                         bpm_media=round(r["bpm_t"].mean(), 1),
-                         bpm_min=round(r["bpm_t"].min(), 1),
-                         bpm_max=round(r["bpm_t"].max(), 1),
-                         ref_min=ref[0] if ref else "", ref_max=ref[1] if ref else "")
-            if ref:
-                centro = (ref[0] + ref[1]) / 2
-                linha["erro_abs_vs_centro_ref"] = round(abs(r["bpm"] - centro), 1)
-                linha["dentro_da_faixa"] = ref[0] <= r["bpm"] <= ref[1]
-            linhas.append(linha)
+            # Linha 1: FFT global
+            # Linha 2: STFT (media temporal)
+            # Linha 3: CWT  (media temporal)
+            entradas = [
+                ("FFT",  r["bpm_fft"],          r["bpm_fft"],          r["bpm_fft"],          0.0),
+                ("STFT", r["bpm_stft"].mean(),  r["bpm_stft"].min(),   r["bpm_stft"].max(),   r["bpm_stft"].std()),
+                ("CWT",  r["bpm_cwt"].mean(),   r["bpm_cwt"].min(),    r["bpm_cwt"].max(),    r["bpm_cwt"].std()),
+            ]
+            for transf, bpm_est, bpm_min, bpm_max, dp in entradas:
+                linha = dict(
+                    video=nome,
+                    metodo=m,
+                    transformada=transf,
+                    bpm_estimado=round(float(bpm_est), 1),
+                    bpm_min=round(float(bpm_min), 1),
+                    bpm_max=round(float(bpm_max), 1),
+                    desvio_padrao=round(float(dp), 2),
+                    ref_min=ref[0] if ref else "",
+                    ref_max=ref[1] if ref else "",
+                )
+                if ref:
+                    centro = (ref[0] + ref[1]) / 2.0
+                    linha["erro_abs_vs_centro_ref"] = round(abs(float(bpm_est) - centro), 1)
+                    linha["dentro_da_faixa"] = ref[0] <= float(bpm_est) <= ref[1]
+                linhas.append(linha)
 
-    campos = ["video", "metodo", "bpm_global", "bpm_media", "bpm_min", "bpm_max",
-              "ref_min", "ref_max", "erro_abs_vs_centro_ref", "dentro_da_faixa"]
+    campos = [
+        "video", "metodo", "transformada", "bpm_estimado", "bpm_min", "bpm_max",
+        "desvio_padrao", "ref_min", "ref_max", "erro_abs_vs_centro_ref", "dentro_da_faixa"
+    ]
     with open(os.path.join(a.saida, "resumo.csv"), "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=campos)
         w.writeheader()
