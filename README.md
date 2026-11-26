@@ -93,7 +93,7 @@ Os experimentos confrontaram 18 combinações ($2\text{ cenários} \times 3\text
 
 | Detecção Facial e ROIs Cutâneas (YCrCb) | Sinal Bruto vs. Filtrado e Não Estacionariedade | Espectrograma (STFT) vs. Escalograma (CWT) |
 | :---: | :---: | :---: |
-| ![ROIs Faciais](resultados/SemMovimento_roi.jpg) | ![Sinal Bruto vs Filtrado](resultados/SemMovimento_bruto_vs_filtrado.png) | ![Tempo-Frequência](resultados/SemMovimento_tempo_frequencia.png) |
+|  | ![Sinal Bruto vs Filtrado](resultados/SemMovimento_bruto_vs_filtrado.png) | ![Tempo-Frequência](resultados/SemMovimento_tempo_frequencia.png) |
 
 ---
 
